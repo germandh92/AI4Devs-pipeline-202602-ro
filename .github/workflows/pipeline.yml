@@ -128,12 +128,14 @@ jobs:
             tar -xzf backend-build.tar.gz
             rm -f backend-build.tar.gz
 
-            # 2) Instalar solo dependencias de producción y regenerar Prisma
-            npm ci --omit=dev
+            # 2) Instalar dependencias y regenerar el cliente de Prisma.
+            #    Se instala TODO (no --omit=dev) porque el CLI de Prisma, que
+            #    necesitamos para generate/migrate, es una devDependency.
+            npm ci
             npx prisma generate
 
-            # 3) (Opcional) aplicar migraciones de BBDD si las usas:
-            # npx prisma migrate deploy
+            # 3) Aplicar migraciones a la BBDD (lee DATABASE_URL del .env de la EC2)
+            npx prisma migrate deploy
 
             # 4) Arrancar o recargar el proceso con PM2.
             #    Las variables de entorno (DATABASE_URL, PORT, ...) deben estar
