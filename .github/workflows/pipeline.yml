@@ -1,0 +1,144 @@
+name: Backend CI/CD Pipeline
+
+# ---------------------------------------------------------------------------
+# Disparador: "push a una rama que tenga un Pull Request abierto".
+#
+# El evento `pull_request` con el tipo `synchronize` es exactamente eso: cada
+# push a la rama de origen de un PR YA ABIERTO vuelve a lanzar el workflow.
+# Se añaden `opened` y `reopened` para cubrir también el momento de abrir/
+# reabrir el PR. Un push a una rama SIN PR abierto no dispara nada.
+# ---------------------------------------------------------------------------
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Si se hace un nuevo push al mismo PR mientras hay una ejecución en curso,
+# se cancela la anterior para no malgastar minutos de Actions.
+concurrency:
+  group: pipeline-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------ TESTS
+  test:
+    name: 1) Tests del backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Generar cliente de Prisma
+        # Necesario para que los tipos generados por Prisma estén disponibles
+        # al compilar/ejecutar los tests. No requiere conexión a la BBDD.
+        run: npx prisma generate
+
+      - name: Ejecutar tests (Jest)
+        run: npm test
+
+  # ------------------------------------------------------------------ BUILD
+  build:
+    name: 2) Build del backend
+    runs-on: ubuntu-latest
+    needs: test
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Generar cliente de Prisma
+        run: npx prisma generate
+
+      - name: Compilar TypeScript (genera ./dist)
+        run: npm run build
+
+      - name: Empaquetar artefacto de despliegue
+        # Solo lo imprescindible para correr en producción: el build (dist),
+        # los manifiestos de dependencias y el esquema de Prisma.
+        run: tar -czf backend-build.tar.gz dist package.json package-lock.json prisma
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-build
+          path: backend/backend-build.tar.gz
+          retention-days: 1
+
+  # ----------------------------------------------------------------- DEPLOY
+  deploy:
+    name: 3) Despliegue en EC2 (PM2)
+    runs-on: ubuntu-latest
+    needs: build
+    # Despliega solo cuando el PR apunta a la rama principal, para no desplegar
+    # en PRs entre ramas de trabajo. Ajusta 'main' a tu rama de producción.
+    if: github.event.pull_request.base.ref == 'main'
+    steps:
+      - name: Descargar artefacto de build
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-build
+
+      - name: Copiar artefacto a la EC2 (scp)
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          source: backend-build.tar.gz
+          target: /home/${{ secrets.EC2_USER }}/app
+
+      - name: Desplegar y (re)arrancar con PM2 (ssh)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          script: |
+            set -e
+            APP_DIR="/home/${{ secrets.EC2_USER }}/app"
+            cd "$APP_DIR"
+
+            # 1) Descomprimir el build recién subido
+            tar -xzf backend-build.tar.gz
+            rm -f backend-build.tar.gz
+
+            # 2) Instalar dependencias y regenerar el cliente de Prisma.
+            #    Se instala TODO (no --omit=dev) porque el CLI de Prisma, que
+            #    necesitamos para generate/migrate, es una devDependency.
+            npm ci
+            npx prisma generate
+
+            # 3) Aplicar migraciones a la BBDD (lee DATABASE_URL del .env de la EC2)
+            npx prisma migrate deploy
+
+            # 4) Arrancar o recargar el proceso con PM2.
+            #    Las variables de entorno (DATABASE_URL, PORT, ...) deben estar
+            #    en $APP_DIR/.env dentro de la propia instancia EC2.
+            pm2 reload backend --update-env || pm2 start dist/index.js --name backend
+            pm2 save
